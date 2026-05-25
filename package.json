@@ -1,0 +1,33 @@
+{
+  "name": "mcp-mail",
+  "version": "1.0.0",
+  "description": "Apple Mail MCP Server",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-mail": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0 <25.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "express": "^5.2.1",
+    "mailparser": "^3.7.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/express": "^5.0.6",
+    "@types/mailparser": "^3.4.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.0.0"
+  }
+}
