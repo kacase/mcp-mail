@@ -1,8 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { writeFileSync } from 'fs';
+import { homedir } from 'os';
+import { isAbsolute, join } from 'path';
 import { MailDB } from './db.js';
-import { findEmlxPath, parseEmlx } from './emlx.js';
-import { sendMessage, replyToMessage, getMessageBody } from './applescript.js';
+import { findEmlxPath, parseEmlx, getAttachmentData } from './emlx.js';
+import { sendMessage, replyToMessage, getMessageBody, getAttachmentViaMail } from './applescript.js';
 
 function formatDate(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toISOString();
@@ -100,7 +103,8 @@ export function registerTools(server: McpServer, db: MailDB, mailRoot: string): 
           name: r.name,
           type: recipientTypeName(r.type),
         })),
-        attachments: attachmentMeta.map(a => ({
+        attachments: attachmentMeta.map((a, i) => ({
+          index: i,
           id: a.rowid,
           name: a.name,
           attachment_id: a.attachment_id,
@@ -262,6 +266,108 @@ export function registerTools(server: McpServer, db: MailDB, mailRoot: string): 
     }
   );
 
-  // Attachments are served as MCP resources via mail-attachment://{messageId}/{index}
-  // registered in index.ts via ResourceTemplate — no tool needed.
+  // Tool 8: get_attachment
+  server.tool(
+    'get_attachment',
+    'Retrieve the contents of a message attachment by index (the "index" field from get_message). ' +
+      'Reads the locally cached copy when available; otherwise asks Apple Mail to download it from the ' +
+      'server (iCloud/IMAP/Exchange). Returns small text/image attachments inline; for anything else, or ' +
+      'to keep the bytes out of context, pass save_path to write the file to disk and get back its path.',
+    {
+      message_id: z.number().describe('Message ROWID'),
+      index: z.number().describe('Attachment index from get_message (the "index" field on each attachment)'),
+      save_path: z
+        .string()
+        .optional()
+        .describe('Absolute path (or ~/...) to write the attachment to. If set, the bytes are saved instead of returned inline.'),
+    },
+    async ({ message_id, index, save_path }) => {
+      const errorResult = (msg: string) => ({
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }],
+        isError: true,
+      });
+
+      const msg = db.getMessage(message_id);
+      if (!msg) {
+        return errorResult('Message not found');
+      }
+
+      // Prefer the locally cached .emlx copy when it exists.
+      let att: Awaited<ReturnType<typeof getAttachmentData>> = null;
+      const emlxPath = findEmlxPath(mailRoot, msg.mailbox_url, message_id);
+      if (emlxPath) {
+        try {
+          att = await getAttachmentData(emlxPath, index);
+        } catch {
+          att = null; // fall through to the server download
+        }
+      }
+
+      // Not cached locally (iCloud/IMAP/Exchange message whose bytes Mail hasn't
+      // downloaded) — ask Apple Mail to fetch it from the server on demand.
+      if (!att) {
+        try {
+          att = await getAttachmentViaMail(message_id, msg.mailbox_url, index);
+        } catch (err) {
+          return errorResult(String(err));
+        }
+      }
+
+      if (!att) {
+        return errorResult(`Attachment index ${index} not found in message ${message_id}`);
+      }
+
+      const meta = {
+        filename: att.filename,
+        content_type: att.contentType,
+        size: att.data.length,
+      };
+
+      // Save to disk when requested — keeps large binaries out of the model context.
+      if (save_path) {
+        const target = save_path.startsWith('~/') ? join(homedir(), save_path.slice(2)) : save_path;
+        if (!isAbsolute(target)) {
+          return errorResult(`save_path must be an absolute path (or start with ~/): ${save_path}`);
+        }
+        try {
+          writeFileSync(target, att.data);
+        } catch (err) {
+          return errorResult(`Failed to write ${target}: ${String(err)}`);
+        }
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ...meta, saved_to: target }, null, 2) }],
+        };
+      }
+
+      // Inline return, sized to what's useful in context.
+      const TEXT_LIMIT = 256 * 1024; // 256 KB
+      const IMAGE_LIMIT = 4 * 1024 * 1024; // 4 MB
+      const BLOB_LIMIT = 1 * 1024 * 1024; // 1 MB
+
+      const content: Array<
+        | { type: 'text'; text: string }
+        | { type: 'image'; data: string; mimeType: string }
+        | { type: 'resource'; resource: { uri: string; mimeType: string; blob: string } }
+      > = [{ type: 'text', text: JSON.stringify(meta, null, 2) }];
+
+      const uri = `mail-attachment://${message_id}/${index}`;
+
+      if (att.contentType.startsWith('text/') && att.data.length <= TEXT_LIMIT) {
+        content.push({ type: 'text', text: att.data.toString('utf8') });
+      } else if (att.contentType.startsWith('image/') && att.data.length <= IMAGE_LIMIT) {
+        content.push({ type: 'image', data: att.data.toString('base64'), mimeType: att.contentType });
+      } else if (att.data.length <= BLOB_LIMIT) {
+        content.push({ type: 'resource', resource: { uri, mimeType: att.contentType, blob: att.data.toString('base64') } });
+      } else {
+        content.push({
+          type: 'text',
+          text:
+            `Attachment is ${(att.data.length / 1024 / 1024).toFixed(1)} MB — too large to return inline. ` +
+            `Re-run with save_path to write it to disk, or read the resource ${uri}.`,
+        });
+      }
+
+      return { content };
+    }
+  );
 }
